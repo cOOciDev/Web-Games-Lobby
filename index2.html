@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Three.js — Forest & Beach + Walkable Player</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { height:100%; margin:0; overflow:hidden; background:#0e0f12; }
+  #ui { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center;
+        color:#d4d8e0; font:14px/1.4 system-ui, sans-serif; pointer-events:none; }
+  #hud { position: fixed; top:10px; left:10px; background:#0008; color:#c9d1e1;
+         padding:8px 10px; border-radius:10px; font:12px/1 system-ui, sans-serif; }
+  #bars { margin-top:6px; display:flex; gap:6px; }
+  .bar { width:120px; height:8px; background:#233043; border-radius:6px; overflow:hidden; }
+  .bar > span { display:block; height:100%; width:100%; }
+  .bar.health > span{ background:#ef4444; }
+  .bar.stam   > span{ background:#22c55e; }
+  #inv { margin-top:6px; }
+  #cross { position:fixed; left:50%; top:50%; translate:-50% -50%; width:12px; height:12px; pointer-events:none; }
+  #cross:before, #cross:after { content:""; position:absolute; background:#dbe3f3; }
+  #cross:before { left:50%; top:0; width:2px; height:12px; translate:-50% 0; opacity:.7;}
+  #cross:after  { top:50%; left:0; width:12px; height:2px; translate:0 -50%; opacity:.7;}
+  .btn { pointer-events:auto; background:#111a; border:1px solid #2a3340; color:#e5e7eb;
+         padding:10px 14px; border-radius:10px; cursor:pointer; user-select:none; }
+  .btn:hover { background:#1b2230; }
+  #hint { position:fixed; bottom:14px; left:50%; translate:-50% 0; color:#d4d8e0; background:#0007; padding:6px 10px; border-radius:8px; font:12px system-ui; display:none; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div><b>WASD</b> move • <b>Mouse</b> look • <b>Shift</b> run • <b>Click</b> chop</div>
+  <div id="bars">
+    <div class="bar health"><span id="hp"></span></div>
+    <div class="bar stam"><span id="st"></span></div>
+  </div>
+  <div id="inv">Wood: <b id="wood">0</b></div>
+</div>
+<div id="ui"><div class="btn" id="start">Click to enter</div></div>
+<div id="cross"></div>
+<div id="hint">Chopping…</div>
+
+<!-- Import map -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+
+/* ---------- Scene / renderer ---------- */
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0xa1c1e0, 0.0022);
+scene.background = new THREE.Color(0xa1c1e0);
+
+const camera = new THREE.PerspectiveCamera(70, 1, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+document.body.appendChild(renderer.domElement);
+
+/* ---------- Lights ---------- */
+scene.add(new THREE.HemisphereLight(0xffffff, 0x224466, 0.9));
+const sun = new THREE.DirectionalLight(0xfff1cf, 1.0);
+sun.position.set(80,120,40);
+scene.add(sun);
+
+/* ---------- World params ---------- */
+const WORLD_SIZE = 600;
+const RES = 256;
+const SEA_LEVEL = 0;
+const BEACH_BAND = 10;           // larger band for clearer beach
+const COAST_X = -WORLD_SIZE*0.22; // x-location of shoreline (sea to the left)
+const COAST_WIDTH = WORLD_SIZE*0.18; // transition width from sea->land
+
+/* ---------- Terrain with explicit coastline ---------- */
+const terrainGeo = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, RES, RES);
+terrainGeo.rotateX(-Math.PI/2);
+
+function coastFactor(x){
+  // 0 at sea side (x << COAST_X), 1 inland. Smooth transition over COAST_WIDTH.
+  return THREE.MathUtils.smoothstep((x - COAST_X) / COAST_WIDTH, 0, 1);
+}
+
+function h(x, z) {
+  // Base rolling hills inland, flattened near the coast
+  const s = 1/60, s2 = 1/18, s3 = 1/7;
+  const n1 = Math.sin(x*s) * Math.cos(z*s);
+  const n2 = Math.sin(x*s2 + 1.7) * Math.sin(z*s2 - 2.1);
+  const n3 = Math.cos(x*s3 - 0.7) * Math.sin(z*s3 + 0.3);
+  const inland = coastFactor(x);
+  const base = (n1*2 + n2*1.2 + n3*0.6) * 2.4 * inland; // hills only inland
+  const dunes = Math.sin((x+z)*0.12)*0.7 * (1 - inland); // subtle dunes near beach
+  return base + dunes;
+}
+
+const pos = terrainGeo.attributes.position;
+const colors = [];
+for (let i=0; i<pos.count; i++) {
+  const x = pos.getX(i);
+  const z = pos.getZ(i);
+  const y = h(x, z);
+  pos.setY(i, y);
+
+  // Color by bands + explicit beach near coast line
+  const inland = coastFactor(x);
+  const dy = y - SEA_LEVEL;
+  let c;
+  if (inland < 0.02) {                      // deep sea (should be covered by water mesh)
+    c = new THREE.Color(0x6fb8ff);
+  } else if (dy < BEACH_BAND) {             // beach
+    c = new THREE.Color(0xf0e0aa);
+  } else if (dy < 30) {                     // forest grass
+    c = new THREE.Color(0x577a47);
+  } else {                                  // rocky
+    c = new THREE.Color(0x8d8f93);
+  }
+  colors.push(c.r, c.g, c.b);
+}
+terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+terrainGeo.computeVertexNormals();
+
+const terrain = new THREE.Mesh(
+  terrainGeo,
+  new THREE.MeshStandardMaterial({ vertexColors:true, roughness:1, metalness:0 })
+);
+terrain.receiveShadow = true;
+scene.add(terrain);
+
+/* ---------- Water: only covers the sea side visually ---------- */
+const waterSize = WORLD_SIZE * 2;
+const waterGeo = new THREE.PlaneGeometry(waterSize, waterSize, 128, 128);
+waterGeo.rotateX(-Math.PI/2);
+const water = new THREE.Mesh(
+  waterGeo,
+  new THREE.MeshPhysicalMaterial({ color: 0x7fc7ff, roughness:0.4, metalness:0, transparent:true, opacity:0.9 })
+);
+water.position.y = SEA_LEVEL - 0.15;
+// Shift the water so it visually sits on the sea side
+water.position.x = COAST_X - waterSize*0.25; // move water plane toward sea
+scene.add(water);
+
+/* ---------- Forest: multiple trunk types (varied cylinders) ---------- */
+const TREE_TYPES = [
+  { // thin pine
+    trunkGeo: new THREE.CylinderGeometry(0.10, 0.18, 2.0, 8),
+    leafGeo:  new THREE.ConeGeometry(0.85, 2.6, 10),
+    trunkCol: 0x5a3a1a, leafCol: 0x2f6b2a
+  },
+  { // medium fir
+    trunkGeo: new THREE.CylinderGeometry(0.14, 0.24, 2.6, 8),
+    leafGeo:  new THREE.ConeGeometry(1.10, 3.2, 10),
+    trunkCol: 0x6a4422, leafCol: 0x3a7f35
+  },
+  { // thick spruce
+    trunkGeo: new THREE.CylinderGeometry(0.18, 0.30, 3.2, 8),
+    leafGeo:  new THREE.ConeGeometry(1.35, 3.6, 10),
+    trunkCol: 0x7a4e28, leafCol: 0x2e5f2a
+  },
+];
+
+const FOREST_DENSITY = 1200; // total desired trees (distributed across types)
+const trunks = [], crowns = [];
+const treeData = []; // per-instance data for chopping
+
+(function spawnForest(){
+  let perType = Math.floor(FOREST_DENSITY / TREE_TYPES.length);
+
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3();
+
+  TREE_TYPES.forEach((T, tIndex) => {
+    const trunkMat = new THREE.MeshStandardMaterial({ color: T.trunkCol, roughness:1 });
+    const leafMat  = new THREE.MeshStandardMaterial({ color: T.leafCol, roughness:0.9 });
+
+    const trunkIM = new THREE.InstancedMesh(T.trunkGeo, trunkMat, perType);
+    const leafIM  = new THREE.InstancedMesh(T.leafGeo,  leafMat,  perType);
+    trunkIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    leafIM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+    let created = 0, tries = 0;
+    while (created < perType && tries < perType*15) {
+      tries++;
+      // Only in forest zone (well inland from beach)
+      const x = (Math.random()*0.9 - 0.05) * WORLD_SIZE;
+      const z = (Math.random()*0.9 - 0.45) * WORLD_SIZE;
+      if (coastFactor(x) < 0.35) continue; // skip near sea/beach
+
+      const y = h(x, z);
+      const dy = y - SEA_LEVEL;
+      if (dy < BEACH_BAND + 1.5) continue;
+      if (dy > 45) continue;
+
+      // Random scaling per instance (height & girth)
+      const scaleY = THREE.MathUtils.randFloat(0.8, 1.4);
+      const scaleXZ = THREE.MathUtils.randFloat(0.85, 1.25);
+      const rotY = Math.random()*Math.PI*2;
+
+      // Slight color jitter (leaves)
+      const tint = new THREE.Color().setHSL(THREE.MathUtils.randFloat(0.28,0.34), 0.55, THREE.MathUtils.randFloat(0.30,0.38));
+      leafIM.setColorAt(created, tint);
+
+      // compose matrices
+      q.setFromEuler(new THREE.Euler(0, rotY, 0));
+      // trunk
+      m.compose(v.set(x, y + (T.trunkGeo.parameters.height*0.5)*scaleY, z), q, v.set(scaleXZ, scaleY, scaleXZ));
+      trunkIM.setMatrixAt(created, m);
+      // crown
+      const leafH = T.leafGeo.parameters.height;
+      m.compose(v.set(x, y + (T.trunkGeo.parameters.height*scaleY) * 0.85 + leafH*0.45*scaleY, z), q, v.set(scaleXZ, scaleY, scaleXZ));
+      leafIM.setMatrixAt(created, m);
+
+      // Record for chopping
+      treeData.push({ type:tIndex, id:created, x, y, z, hp:3, alive:true });
+      created++;
+    }
+
+    trunkIM.count = leafIM.count = perType;
+    trunkIM.instanceMatrix.needsUpdate = true;
+    leafIM.instanceMatrix.needsUpdate = true;
+    trunks.push(trunkIM); crowns.push(leafIM);
+    scene.add(trunkIM, leafIM);
+  });
+})();
+
+/* ---------- Player / controls ---------- */
+const controls = new PointerLockControls(camera, document.body);
+const startBtn = document.getElementById('start');
+const ui = document.getElementById('ui');
+startBtn.addEventListener('click', () => controls.lock());
+controls.addEventListener('lock', () => { ui.style.display = 'none'; });
+controls.addEventListener('unlock', () => { ui.style.display = 'flex'; });
+
+const move = { f:false, b:false, l:false, r:false, run:false };
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyW') move.f = true;
+  if (e.code === 'KeyS') move.b = true;
+  if (e.code === 'KeyA') move.l = true;
+  if (e.code === 'KeyD') move.r = true;
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') move.run = true;
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'KeyW') move.f = false;
+  if (e.code === 'KeyS') move.b = false;
+  if (e.code === 'KeyA') move.l = false;
+  if (e.code === 'KeyD') move.r = false;
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') move.run = false;
+});
+
+const player = { height: 1.7, pos: new THREE.Vector3(COAST_X+50, 10, 0), hp:100, stam:100 };
+const hpEl = document.getElementById('hp');
+const stEl = document.getElementById('st');
+const woodEl = document.getElementById('wood');
+const hintEl = document.getElementById('hint');
+let wood = 0;
+
+/* ---------- Simple hands + axe (as before) ---------- */
+const hands = new THREE.Group();
+const rightHand = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.12, 0.3), new THREE.MeshStandardMaterial({ color: 0xe1b29a, roughness:0.7 }));
+rightHand.position.set(0.32, -0.28, -0.6);
+rightHand.rotation.set(-0.3, 0.4, 0.1);
+hands.add(rightHand);
+const axe = new THREE.Group();
+const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.9, 8), new THREE.MeshStandardMaterial({ color: 0x8b5a2b }));
+handle.rotation.z = Math.PI/2; handle.position.set(0.05, -0.1, -0.6);
+const head = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.16, 0.06), new THREE.MeshStandardMaterial({ color: 0xaaaaaa, roughness:0.4, metalness:0.6 }));
+head.position.set(0.45, 0.02, -0.6);
+axe.add(handle, head); hands.add(axe);
+camera.add(hands); scene.add(camera);
+let swingT = 0, swinging = false; const swing = ()=>{ swinging=true; swingT=0; };
+
+/* ---------- Helpers: height sampling ---------- */
+const gridW = RES+1, gridH = RES+1;
+const step = WORLD_SIZE / RES;
+function heightAt(x, z) {
+  const lx = (x + WORLD_SIZE/2) / step;
+  const lz = (z + WORLD_SIZE/2) / step;
+  const x0 = Math.floor(lx), z0 = Math.floor(lz);
+  const x1 = x0 + 1, z1 = z0 + 1;
+  if (x0 < 0 || z0 < 0 || x1 >= gridW || z1 >= gridH) return SEA_LEVEL - 3;
+  const ix = (i,j) => (j*gridW + i) * 3 + 1;
+  const py = terrain.geometry.attributes.position.array;
+  const y00 = py[ix(x0,z0)], y10 = py[ix(x1,z0)];
+  const y01 = py[ix(x0,z1)], y11 = py[ix(x1,z1)];
+  const tx = lx - x0, tz = lz - z0;
+  const ya = y00*(1-tx) + y10*tx;
+  const yb = y01*(1-tx) + y11*tx;
+  return ya*(1-tz) + yb*tz;
+}
+
+/* ---------- Raycast chopping across all trunk/crown meshes ---------- */
+const raycaster = new THREE.Raycaster();
+const CHOP_RANGE = 2.6;
+let chopCooldown = 0;
+
+function tryChop() {
+  if (chopCooldown > 0) return;
+  raycaster.setFromCamera({x:0,y:0}, camera);
+
+  // gather hits from all instanced sets
+  const hits = [];
+  trunks.forEach((im, idx) => hits.push(...raycaster.intersectObject(im, true)));
+  crowns.forEach((im, idx) => hits.push(...raycaster.intersectObject(im, true)));
+  if (!hits.length) return;
+
+  const hit = hits.filter(h=>h.distance<=CHOP_RANGE).sort((a,b)=>a.distance-b.distance)[0];
+  if (!hit || typeof hit.instanceId !== 'number') return;
+
+  // Which pool did we hit? find its global index in treeData (same creation order)
+  let base = 0, typeIndex = -1, localId = hit.instanceId;
+  const perType = Math.floor(FOREST_DENSITY / TREE_TYPES.length);
+  // quick math: each type created exactly perType entries in order
+  typeIndex = Math.min(Math.floor(hit.instanceId / perType), TREE_TYPES.length-1);
+  // But above is approximate if densities shift; safer: search nearest tree
+  let closest = -1, bestD = 1e9, p = hit.point;
+  for (let i=0;i<treeData.length;i++){
+    const td = treeData[i];
+    const d = (td.x-p.x)*(td.x-p.x)+(td.z-p.z)*(td.z-p.z);
+    if (d<bestD){bestD=d; closest=i;}
+  }
+  const T = treeData[closest];
+  if (!T || !T.alive) return;
+
+  T.hp -= 1;
+  hintEl.textContent = T.hp > 0 ? "Hit tree!" : "+1 wood";
+  hintEl.style.display = 'block';
+  setTimeout(()=>hintEl.style.display='none', 500);
+  swing();
+
+  if (T.hp <= 0) {
+    T.alive = false; wood++; woodEl.textContent = wood.toString();
+
+    // remove from both trunk & crown pools of its type
+    const tIdx = T.type;
+    const id   = T.id;
+
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3();
+    const gone = 0.0001;
+    q.set(0,0,0,1);
+    m.compose(v.set(T.x, T.y-5, T.z), q, v.setScalar(gone));
+    trunks[tIdx].setMatrixAt(id, m);
+    crowns[tIdx].setMatrixAt(id, m);
+    trunks[tIdx].instanceMatrix.needsUpdate = true;
+    crowns[tIdx].instanceMatrix.needsUpdate = true;
+  }
+
+  chopCooldown = 0.35;
+}
+document.addEventListener('mousedown', e => { if (e.button===0 && controls.isLocked) tryChop(); });
+
+/* ---------- Resize ---------- */
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- Animation loop ---------- */
+let last = performance.now();
+function animate(now){
+  const dt = Math.min((now-last)/1000, 0.05); last = now;
+
+  // Water ripples
+  const wa = water.geometry.attributes.position;
+  for (let i=0; i<wa.count; i++) {
+    const x = water.geometry.attributes.position.getX(i);
+    const z = water.geometry.attributes.position.getZ(i);
+    const yy = SEA_LEVEL - 0.15 + Math.sin((x+now*0.12)*0.02)*0.06 + Math.cos((z-now*0.09)*0.02)*0.06;
+    wa.setY(i, yy);
+  }
+  wa.needsUpdate = true; water.geometry.computeVertexNormals();
+
+  // Movement
+  const speed = (move.run ? 11 : 6);
+  if (controls.isLocked){
+    const forward = new THREE.Vector3(); controls.getDirection(forward); forward.y=0; forward.normalize();
+    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0)).negate();
+
+    const dir = new THREE.Vector3();
+    if (move.f) dir.add(forward); if (move.b) dir.sub(forward);
+    if (move.l) dir.sub(right);   if (move.r) dir.add(right);
+    if (dir.lengthSq()>0) dir.normalize();
+
+    player.pos.addScaledVector(dir, speed*dt);
+    player.pos.x = THREE.MathUtils.clamp(player.pos.x, -WORLD_SIZE*0.49, WORLD_SIZE*0.49);
+    player.pos.z = THREE.MathUtils.clamp(player.pos.z, -WORLD_SIZE*0.49, WORLD_SIZE*0.49);
+    const groundY = heightAt(player.pos.x, player.pos.z);
+    player.pos.y = groundY + player.height;
+    controls.object.position.copy(player.pos);
+  }
+
+  // Hands idle / swing
+  const t = now*0.002;
+  if (swinging){ swingT += dt*8; const a = Math.sin(Math.min(swingT,Math.PI))*0.7; hands.rotation.set(-a*0.6,0,-a*0.2); if (swingT>=Math.PI){ swinging=false; hands.rotation.set(0,0,0);} }
+  else { hands.position.x = Math.sin(t*2.2)*0.01; hands.position.y = -0.02 + Math.sin(t*1.7)*0.01; }
+
+  // Stamina ui (simple)
+  player.stam += (move.run ? -20*dt : 10*dt);
+  player.stam = THREE.MathUtils.clamp(player.stam, 0, 100);
+  document.getElementById('hp').style.width = player.hp + "%";
+  document.getElementById('st').style.width = player.stam + "%";
+  chopCooldown = Math.max(0, chopCooldown - dt);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+/* ---------- Start pos near coast, looking inland ---------- */
+const gy = heightAt(player.pos.x, player.pos.z);
+player.pos.y = gy + player.height;
+controls.object.position.copy(player.pos);
+camera.lookAt(player.pos.x+50, player.pos.y, player.pos.z);
+</script>
+</body>
+</html>
